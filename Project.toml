@@ -1,0 +1,22 @@
+name = "VoF"
+uuid = "5b1c8e3a-7f6d-4d2b-bd84-9a2f5d18e2a1"
+authors = ["Panagiotis Georgakopoulos <panagiotis.georgakopoulos@juliahub.com>"]
+version = "0.1.0-DEV"
+
+[deps]
+KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+WaterLily = "ed894a53-35f9-47f1-b17f-85db9237eebd"
+
+[compat]
+KernelAbstractions = "0.9"
+StaticArrays = "^1.1"
+WaterLily = "1.7"
+julia = "1.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

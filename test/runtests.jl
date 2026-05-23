@@ -5,6 +5,71 @@ using StaticArrays
 
 @testset "VoF" begin
 
+    @testset "VoFFlow construction" begin
+        dims = (16, 16)
+        vof = VoFFlow(dims;
+            α₀ = (i,x) -> x[2] < 8 ? 1f0 : 0f0,
+            ρ_w = 1000.0, ρ_a = 1.0,
+            μ_w = 1e-3,   μ_a = 1.8e-5,
+        )
+        # α matches the IC
+        @test vof.α[8, 2]  ≈ 1f0
+        @test vof.α[8, 16] ≈ 0f0
+
+        # ν_eff = μ/ρ ⇒ in water 1e-3/1000 = 1e-6; in air 1.8e-5/1 = 1.8e-5
+        @test isapprox(vof.ν[8, 2],  Float32(1e-3/1000);   rtol=1e-4)
+        @test isapprox(vof.ν[8, 16], Float32(1.8e-5/1.0);  rtol=1e-4)
+
+        # L = 1/ρ_face ⇒ in water 1/1000, in air 1/1
+        @test size(vof.L) == ((dims .+ 2)..., 2)
+        @test isapprox(vof.L[8, 2,  1], Float32(1/1000); rtol=1e-3)
+        @test isapprox(vof.L[8, 16, 2], Float32(1.0);    rtol=1e-3)
+    end
+
+    @testset "VoFFlow interface face uses harmonic mean" begin
+        dims = (4, 4)
+        # Sharp interface: water at j=1,2 (y < waterline); air at j=3,4.
+        # Cell-centre y = j-1.5 → waterline at y=2 (between j=3 and j=4).
+        vof = VoFFlow(dims;
+            α₀ = (i,x) -> x[2] < 2 ? 1f0 : 0f0,
+            ρ_w = 1000.0, ρ_a = 1.0,
+            μ_w = 1e-3,   μ_a = 1.8e-5,
+        )
+        # j=4 in the y-direction is between cell (any, 3) [water] and cell (any, 4) [air].
+        # Cell centre y for j=3 is 1.5 (water), for j=4 is 2.5 (air).
+        # 1/ρ_face = 0.5(1/1000 + 1/1) = 0.5005
+        L_face = vof.L[2, 4, 2]
+        @test isapprox(L_face, Float32(0.5 * (1/1000 + 1)); rtol=1e-3)
+    end
+
+    @testset "step_vof! preserves clamping" begin
+        # Build the smallest sensible coupled flow + Poisson + VoF system
+        # and take a few steps. α must stay in [0,1].
+        dims = (16, 16)
+        vof = VoFFlow(dims;
+            α₀ = (i,x) -> x[2] < 8 ? 1f0 : 0f0,
+            ρ_w = 1000.0, ρ_a = 1.0,
+            μ_w = 1e-3,   μ_a = 1.8e-5,
+        )
+        flow = WaterLily.Flow(dims, (0f0, 0f0);
+            T = Float32,
+            ν = vof.ν,
+            g = (i, x, t) -> i == 2 ? -9.81f0 : 0f0,
+        )
+        # Build a minimal struct that pretends to be a Simulation —
+        # step_vof! only reads sim.flow and sim.pois.
+        L0 = copy(vof.L)
+        pois = WaterLily.MultiLevelPoisson(flow.p, L0, flow.σ)
+        sim = (flow=flow, pois=pois)
+
+        for _ in 1:5
+            step_vof!(vof, sim; dt = 0.01)
+        end
+        @test minimum(vof.α) ≥ 0f0
+        @test maximum(vof.α) ≤ 1f0
+    end
+
+
     # Coordinate convention: AlphaField uses cell-center coords
     #     x = I.I .- 1.5
     # so for a grid of size N, interior cell-center x ranges over 0.5 to N-0.5.

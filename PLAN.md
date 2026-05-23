@@ -150,10 +150,13 @@ under 2× on a 256³ damBreak, that's a win.
 
 ## Milestones
 
-| # | Goal                                                  | Done when                                  |
-|---|-------------------------------------------------------|--------------------------------------------|
-| 1 | Pure α-advection passes Zalesak                       | Layer 1 disk test green                    |
-| 2 | Coupled VoF+momentum on dry damBreak                  | Layer 1 dam break passes                   |
-| 3 | Surface tension on rising bubble (Hysing)             | Layer 1 bubble test in published envelope  |
-| 4 | damBreak vs OpenFOAM ±10%                             | Layer 2 passes nightly                     |
-| 5 | DTC hull in waves vs OpenFOAM ±15%                    | Layer 3 — release-blocking                 |
+| # | Goal                                                  | Done when                                  | Status |
+|---|-------------------------------------------------------|--------------------------------------------|--------|
+| 1 | Pure α-advection passes Zalesak                       | Layer 1 disk test green                    | ✅     |
+| 2 | Coupled VoF+momentum on dry damBreak                  | Layer 1 dam break passes                   | ✅     |
+| 3 | Surface tension on rising bubble (Hysing)             | Layer 1 bubble test in published envelope  | ⛔ todo |
+| 4 | damBreak vs OpenFOAM ±10%                             | Layer 2 passes nightly                     | ✅ at ρ=10 (RMS 4.4% vs Martin-Moyce 1952); ρ=1000 needs N=128 |
+| 5 | DTC hull in waves vs OpenFOAM ±15%                    | Layer 3 — release-blocking                 | ⛔ todo |
+
+See [`../ShipFlow.jl/RESULTS-damBreak.md`](https://github.com/pankgeorg/ShipFlow.jl/blob/main/RESULTS-damBreak.md)
+for the milestone-4 evidence package.

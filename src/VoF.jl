@@ -187,10 +187,14 @@ Call this after `sim_step!(sim)`. The Flow must have been constructed with
 """
 function step_vof!(vof::VoFFlow{T}, sim;
                    dt::Real = sim.flow.Δt[end-1],
-                   perdir=()) where T
-    # 1. advect α
+                   perdir=(),
+                   λ = WaterLily.vanLeer) where T
+    # 1. advect α with a TVD limiter (vanLeer by default — bounded,
+    # second-order, and considerably reduces the α overshoots that
+    # the clamp absorbs and turns into mass loss). Pass λ=WaterLily.quick
+    # to recover the original QUICK behaviour.
     WaterLily.transport!(vof.r, vof.α, sim.flow.u, vof.Φ;
-                         D_diff=zero(T), perdir=perdir)
+                         D_diff=zero(T), λ=λ, perdir=perdir)
     @inbounds for I in CartesianIndices(vof.α)
         vof.α[I] = clamp(vof.α[I] + T(dt) * vof.r[I],
                          zero(T), one(T))

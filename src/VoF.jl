@@ -189,25 +189,66 @@ function step_vof!(vof::VoFFlow{T}, sim;
                    dt::Real = sim.flow.Δt[end-1],
                    perdir=(),
                    λ = WaterLily.vanLeer,
-                   clamp_α::Bool = true) where T
+                   clamp_α::Bool = true,
+                   mass_repair::Bool = false) where T
     # 1. advect α with a TVD limiter (vanLeer by default — bounded,
     # second-order, and considerably reduces the α overshoots that
-    # the clamp absorbs and turns into mass loss). Pass λ=WaterLily.quick
-    # to recover the original QUICK behaviour.
+    # the clamp absorbs and turns into mass loss).
     WaterLily.transport!(vof.r, vof.α, sim.flow.u, vof.Φ;
                          D_diff=zero(T), λ=λ, perdir=perdir)
+
+    # Track pre-clamp mass for optional repair (only over interior cells).
+    Ng = size(vof.α)
+    interior = CartesianIndices(ntuple(d -> 2:Ng[d]-1, ndims(vof.α)))
+    pre_mass = zero(T)
+    if mass_repair
+        @inbounds for I in interior
+            pre_mass += vof.α[I] + T(dt) * vof.r[I]
+        end
+    end
+
     if clamp_α
         @inbounds for I in CartesianIndices(vof.α)
             vof.α[I] = clamp(vof.α[I] + T(dt) * vof.r[I],
                              zero(T), one(T))
         end
     else
-        # No clamp: α can drift outside [0,1] but mass is conserved
-        # exactly by the divergence-form transport. Use for diagnostic
-        # only — _refresh_ν!/_refresh_L! below will misbehave for
-        # out-of-range α.
+        # No clamp: α can drift outside [0,1]. For diagnostic only.
         @inbounds for I in CartesianIndices(vof.α)
             vof.α[I] += T(dt) * vof.r[I]
+        end
+    end
+
+    # 1b. Optional mass-repair: redistribute the clamping deficit into
+    # interface cells (0 < α < 1) proportional to their slack to
+    # [0, 1]. Linear in cells but globally redistributive — half-step
+    # toward MULES, not equivalent.
+    if mass_repair
+        post_mass = zero(T)
+        @inbounds for I in interior
+            post_mass += vof.α[I]
+        end
+        deficit = pre_mass - post_mass
+        if abs(deficit) > 0
+            # Slack capacity for positive deficit, slack for negative.
+            capacity = zero(T)
+            @inbounds for I in interior
+                ai = vof.α[I]
+                if zero(T) < ai < one(T)
+                    capacity += deficit > 0 ? (one(T) - ai) : ai
+                end
+            end
+            if capacity > 0
+                scale = deficit / capacity
+                @inbounds for I in interior
+                    ai = vof.α[I]
+                    if zero(T) < ai < one(T)
+                        bump = deficit > 0 ? scale * (one(T) - ai) :
+                                              scale * ai
+                        vof.α[I] = clamp(ai + bump, zero(T), one(T))
+                    end
+                end
+            end
         end
     end
     # 2. refresh ν_eff (in-place — array shared with flow)

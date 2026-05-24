@@ -132,6 +132,63 @@ using StaticArrays
         @test maximum(αf.α) ≤ 1f0
     end
 
+    @testset "_bc_α! periodic round-trip" begin
+        # Fill α with a y-varying sinusoid and confirm that periodic
+        # BC wraps it: ghost cell 1 should match interior cell N+1,
+        # and ghost cell N+2 should match interior cell 2.
+        Ny = 16
+        dims = (8, Ny)
+        vof = VoFFlow(dims;
+            α₀ = (i, x) -> 0.5f0 + 0.5f0 * sin(2pi * x[2] / Ny),
+            ρ_w = 1.0, ρ_a = 1.0,
+            μ_w = 1e-3, μ_a = 1e-3,
+        )
+        # Scramble the ghost layer first to make sure _bc_α! restores
+        # it (not the constructor IC).
+        vof.α[:, 1]       .= -99f0
+        vof.α[:, Ny + 2]  .= -99f0
+        VoF._bc_α!(vof.α, (2,))
+        for i in 2:dims[1] + 1
+            @test vof.α[i, 1]      ≈ vof.α[i, Ny + 1]
+            @test vof.α[i, Ny + 2] ≈ vof.α[i, 2]
+        end
+    end
+
+    @testset "MULES preserves [0,1] under uniform translation" begin
+        # +x translation of a sharp step at constant velocity. The
+        # limiter must keep α bounded.
+        dims = (32, 16, 16)
+        vof = VoFFlow(dims;
+            α₀ = (i, x) -> x[1] < 10 ? 1f0 : 0f0,
+            ρ_w = 1.0, ρ_a = 1.0, μ_w = 1e-3, μ_a = 1e-3,
+        )
+        sim = WaterLily.Simulation(dims, (1f0, 0f0, 0f0), 1f0;
+            T = Float32, ν = vof.ν, Δt = 0.25f0, ϵ = 1, U = 1f0,
+        )
+        sim.flow.u .= 0f0
+        sim.flow.u[:, :, :, 1] .= 1f0
+        for _ in 1:6
+            step_vof_mules!(vof, sim; dt = 0.25f0)
+        end
+        @test minimum(vof.α) ≥ -1f-4
+        @test maximum(vof.α) ≤ 1f0 + 1f-4
+    end
+
+    @testset "interior() helper hits only physical cells" begin
+        dims = (8, 8, 8)
+        vof = VoFFlow(dims;
+            α₀ = (i, x) -> 0f0,
+            ρ_w = 1.0, ρ_a = 1.0, μ_w = 1e-3, μ_a = 1e-3,
+        )
+        idx = VoF.interior(vof)
+        @test size(idx) == dims
+        for I in idx
+            for d in 1:3
+                @test 2 ≤ I[d] ≤ dims[d] + 1
+            end
+        end
+    end
+
     @testset "rotation conserves mass within bounded drift" begin
         # Solid-body rotation about (cx, cy). A blob rotates; total mass
         # may drift slightly because of upwind clamping at the edge of

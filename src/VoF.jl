@@ -1,10 +1,15 @@
 module VoF
 
 using WaterLily
-using StaticArrays
+using StaticArrays: SVector
 
 export AlphaField, step_alpha!, VoFFlow, step_vof!, build_initial_L,
-       transport_upwind!, step_vof_mules!
+       step_vof_mules!, interior
+
+# Harmonic-mean of 1/ρ for the face Poisson coefficient; module-scope so the
+# inner loop doesn't close over `vof`.
+@inline _invρ(α, I, ρ_w::T, ρ_a::T) where T =
+    inv(α[I] * ρ_w + (one(T) - α[I]) * ρ_a)
 
 # ----------------------------------------------------------------------------
 # Pure α-advection (v0.1) — kept for back-compat with the existing unit tests
@@ -97,8 +102,13 @@ After each WaterLily step, call `step_vof!(vof, sim)` to:
 Gravity is applied via `Flow(...; g=(i,x,t)->(i==2 ? -g_phys : 0))` — uniform
 acceleration (same on water and air). The variable-density physics emerges
 from the L coefficient in the projection step.
+
+**Array layout.** `α`, `ν`, `r`, `Φ` are sized `grid_size .+ 2` with one
+ghost cell per side; `L` is `(grid_size .+ 2)..., D`. The interior cells
+are at `CartesianIndices(ntuple(d -> 2:N[d]-1, D))`. Use [`interior`](@ref)
+to iterate the interior of any `VoFFlow` field.
 """
-mutable struct VoFFlow{T, Sf<:AbstractArray{T}, Vf<:AbstractArray{T}}
+struct VoFFlow{T, Sf<:AbstractArray{T}, Vf<:AbstractArray{T}}
     α   :: Sf
     r   :: Sf
     Φ   :: Sf
@@ -108,20 +118,29 @@ mutable struct VoFFlow{T, Sf<:AbstractArray{T}, Vf<:AbstractArray{T}}
     ρ_a :: T
     μ_w :: T
     μ_a :: T
-    # MULES workspace — allocated lazily on first call to step_vof_mules!.
-    # Each field is `nothing` until needed, then sized to the grid.
-    _mules_α_old :: Union{Nothing, Sf}
-    _mules_α_UD  :: Union{Nothing, Sf}
-    _mules_α_max :: Union{Nothing, Sf}
-    _mules_α_min :: Union{Nothing, Sf}
-    _mules_P_pos :: Union{Nothing, Sf}
-    _mules_P_neg :: Union{Nothing, Sf}
-    _mules_R_pos :: Union{Nothing, Sf}
-    _mules_R_neg :: Union{Nothing, Sf}
-    _mules_ΦU    :: Union{Nothing, Vf}
-    _mules_ΦH    :: Union{Nothing, Vf}
-    _mules_λface :: Union{Nothing, Vf}
+    # MULES workspace, allocated eagerly so step_vof_mules! has no first-call
+    # cost and the struct stays immutable + type-stable.
+    _mules_α_old :: Sf
+    _mules_α_UD  :: Sf
+    _mules_α_max :: Sf
+    _mules_α_min :: Sf
+    _mules_P_pos :: Sf
+    _mules_P_neg :: Sf
+    _mules_R_pos :: Sf
+    _mules_R_neg :: Sf
+    _mules_ΦU    :: Vf
+    _mules_ΦH    :: Vf
+    _mules_λface :: Vf
 end
+
+"""
+    interior(vof::VoFFlow) -> CartesianIndices
+
+Indices of the interior (non-ghost) cells of `vof.α`. Sized `grid_size`.
+Use to iterate physical cells without touching the one-cell ghost layer.
+"""
+@inline interior(vof::VoFFlow) =
+    CartesianIndices(ntuple(d -> 2:size(vof.α, d) - 1, ndims(vof.α)))
 
 function VoFFlow(grid_size::NTuple{D,Int};
                  α₀,
@@ -139,33 +158,13 @@ function VoFFlow(grid_size::NTuple{D,Int};
     vof = VoFFlow{T, typeof(α), typeof(L)}(
         α, r, Φ, ν, L,
         T(ρ_w), T(ρ_a), T(μ_w), T(μ_a),
-        nothing, nothing, nothing, nothing,
-        nothing, nothing, nothing, nothing,
-        nothing, nothing, nothing,
+        similar(α), similar(α), similar(α), similar(α),
+        similar(α), similar(α), similar(α), similar(α),
+        similar(L), similar(L), similar(L),
     )
     _refresh_ν!(vof)
     _refresh_L!(vof)
     return vof
-end
-
-# Lazily allocate the MULES workspace on the first call to step_vof_mules!.
-function _ensure_mules_workspace!(vof::VoFFlow{T, Sf, Vf}) where {T, Sf, Vf}
-    if vof._mules_α_old !== nothing
-        return nothing
-    end
-    Ng = size(vof.α); D = ndims(vof.α)
-    vof._mules_α_old = similar(vof.α)
-    vof._mules_α_UD  = similar(vof.α)
-    vof._mules_α_max = similar(vof.α)
-    vof._mules_α_min = similar(vof.α)
-    vof._mules_P_pos = similar(vof.α)
-    vof._mules_P_neg = similar(vof.α)
-    vof._mules_R_pos = similar(vof.α)
-    vof._mules_R_neg = similar(vof.α)
-    vof._mules_ΦU    = similar(vof.L)
-    vof._mules_ΦH    = similar(vof.L)
-    vof._mules_λface = similar(vof.L)
-    return nothing
 end
 
 # Per-cell effective kinematic viscosity ν = μ_local / ρ_local.
@@ -188,20 +187,14 @@ function _refresh_L!(vof::VoFFlow{T}; perdir=()) where T
     L   = vof.L
     D   = ndims(α)
     Ng  = size(α)
-    invρ_at(I) = let a = α[I]
-        ρ = a * vof.ρ_w + (one(T) - a) * vof.ρ_a
-        inv(ρ)
-    end
+    ρ_w = vof.ρ_w; ρ_a = vof.ρ_a
+    # Faces only between cells with index ≥ 2 along axis j; the ghost face
+    # (I[j] == 1) is overwritten by BC! below — don't bother writing it.
     @inbounds for j in 1:D
-        for I in CartesianIndices(α)
-            iL = invρ_at(I)
-            if I.I[j] > 1
-                I_prev = CartesianIndex(ntuple(k -> k == j ? I.I[k] - 1 : I.I[k], D))
-                iL_prev = invρ_at(I_prev)
-                L[I, j] = T(0.5 * (iL + iL_prev))
-            else
-                L[I, j] = T(iL)
-            end
+        for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (1:Ng[k]), D))
+            iL      = _invρ(α, I, ρ_w, ρ_a)
+            iL_prev = _invρ(α, I - WaterLily.δ(j, I), ρ_w, ρ_a)
+            L[I, j] = (iL + iL_prev) / 2
         end
     end
     # Match WaterLily's μ₀ boundary convention: zero L at the wall ghost
@@ -268,10 +261,16 @@ function step_vof!(vof::VoFFlow{T}, sim;
         deficit = pre_mass - post_mass
         if abs(deficit) > 0
             # Slack capacity for positive deficit, slack for negative.
+            # Include cells that are not yet pinned to the deficit's
+            # endpoint (positive deficit ⇒ accept cells with ai < 1;
+            # negative deficit ⇒ accept cells with ai > 0). The previous
+            # `zero(T) < ai < one(T)` form excluded any cell already
+            # clamped exactly to 0 or 1, which under-redistributed.
+            ε = eps(T)
             capacity = zero(T)
             @inbounds for I in interior
                 ai = vof.α[I]
-                if zero(T) < ai < one(T)
+                if deficit > 0 ? ai < one(T) - ε : ai > ε
                     capacity += deficit > 0 ? (one(T) - ai) : ai
                 end
             end
@@ -279,7 +278,8 @@ function step_vof!(vof::VoFFlow{T}, sim;
                 scale = deficit / capacity
                 @inbounds for I in interior
                     ai = vof.α[I]
-                    if zero(T) < ai < one(T)
+                    accept = deficit > 0 ? ai < one(T) - ε : ai > ε
+                    if accept
                         bump = deficit > 0 ? scale * (one(T) - ai) :
                                               scale * ai
                         vof.α[I] = clamp(ai + bump, zero(T), one(T))
@@ -293,13 +293,17 @@ function step_vof!(vof::VoFFlow{T}, sim;
     # 3. refresh L
     _refresh_L!(vof)
     # 4. propagate L into the Poisson levels.
-    # MultiLevelPoisson has its own L array that is COPIED to levels[1].L
-    # at construction. We need to copy vof.L over levels[1].L and then call
-    # update! which restricts to coarser levels and refreshes D, iD.
+    _push_L_to_pois!(vof, sim)
+    return vof.α
+end
+
+# Push the just-refreshed L into all Poisson levels. MultiLevelPoisson's
+# `L` was COPIED into `levels[1].L` at construction, so we re-copy on each
+# step and let `update!` restrict to coarser levels.
+function _push_L_to_pois!(vof::VoFFlow, sim)
     sim.pois.levels[1].L .= vof.L
     sim.pois.L           .= vof.L
     WaterLily.update!(sim.pois)
-    return vof.α
 end
 
 """
@@ -362,25 +366,22 @@ end
 
 """
     step_vof_mules!(vof::VoFFlow, sim;
-                    dt=sim.flow.Δt[end-1], n_sweeps=3,
+                    dt=sim.flow.Δt[end-1],
                     λ_HO=WaterLily.vanLeer, perdir=())
 
 MULES α-advection step. Replaces `step_vof!` for cases where local
 mass conservation matters (Kelvin waves, sloshing, …). The high-order
 flux is computed with `λ_HO` (vanLeer by default), the upwind flux
-provides the monotone base, and `n_sweeps` (default 3) iterations of
-the per-cell limiter tighten λ_face to keep each cell's α inside its
-local extremum envelope.
+provides the monotone base, and a per-face Zalesak limiter tightens
+λ_face to keep each cell's α inside its local extremum envelope.
 
 After advecting α, refreshes `vof.ν` and `vof.L` exactly as `step_vof!`
 does.
 """
 function step_vof_mules!(vof::VoFFlow{T}, sim;
                          dt::Real = sim.flow.Δt[end-1],
-                         n_sweeps::Int = 3,   # unused for now (cell-FCT pass)
                          λ_HO = WaterLily.vanLeer,
                          perdir = ()) where T
-    _ensure_mules_workspace!(vof)
     α     = vof.α
     α_old = vof._mules_α_old
     α_UD  = vof._mules_α_UD
@@ -443,7 +444,7 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
     _bc_α!(α_UD, perdir)
 
     # 3. Local extrema per cell (from α_old over a 3-point per-direction stencil).
-    _local_extrema!(α_max, α_min, α_old, Ng, D)
+    _local_extrema!(α_max, α_min, α_old, Ng)
 
     # 4. Cell-by-cell accumulate the positive / negative anti-diffusive
     # contributions from all incident faces.
@@ -495,9 +496,7 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
     _bc_α!(vof.α, perdir)
     _refresh_ν!(vof)
     _refresh_L!(vof; perdir=perdir)
-    sim.pois.levels[1].L .= vof.L
-    sim.pois.L           .= vof.L
-    WaterLily.update!(sim.pois)
+    _push_L_to_pois!(vof, sim)
     return vof.α
 end
 
@@ -526,7 +525,7 @@ end
 # Local 3-point per-direction extrema for each cell (interior only).
 function _local_extrema!(α_max, α_min,
                         α::AbstractArray{T,D},
-                        Ng::NTuple, D_::Int) where {T,D}
+                        Ng::NTuple) where {T,D}
     α_max .= α
     α_min .= α
     for j in 1:D

@@ -353,15 +353,22 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
     # 1. Compute per-face upwind flux ΦU[I, j] and high-order flux ΦH[I, j].
     # WaterLily face-storage convention: face j at index I lies between
     # cells I-δ(j,I) and I; u[CI(I,j)] is the velocity normal to that face.
+    # Boundary faces (I[j] = 2 or I[j] = Ng[j]) only get the upwind flux —
+    # the high-order ϕu stencil reaches I-2δ(j) which is out of bounds at
+    # the boundary, so we set ΦH = ΦU there ⇒ A_face = 0 ⇒ no anti-
+    # diffusive correction at boundaries (but the upwind transport still
+    # delivers / removes mass through them, fixing the drainage bug).
     ΦU = zeros(T, Ng..., D)
     ΦH = zeros(T, Ng..., D)
     @inbounds for j in 1:D
-        for I in CartesianIndices(ntuple(k -> k == j ? (3:Ng[k]-1) : (2:Ng[k]-1), D))
+        for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (2:Ng[k]-1), D))
             uf = u[WaterLily.CI(I, j)]
-            # Upwind:
             ΦU[I, j] = uf * (uf >= 0 ? α_old[I - WaterLily.δ(j, I)] : α_old[I])
-            # High-order using WaterLily's ϕu (QUICK / vanLeer / cds):
-            ΦH[I, j] = WaterLily.ϕu(j, I, α_old, uf, λ_HO)
+            if I.I[j] == 2 || I.I[j] == Ng[j]
+                ΦH[I, j] = ΦU[I, j]    # no anti-diff at boundary
+            else
+                ΦH[I, j] = WaterLily.ϕu(j, I, α_old, uf, λ_HO)
+            end
         end
     end
 
@@ -369,7 +376,7 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
     # WaterLily convention: face flux Φ enters cell I, leaves cell I-δ(j,I).
     α_UD = copy(α_old)
     @inbounds for j in 1:D
-        for I in CartesianIndices(ntuple(k -> k == j ? (3:Ng[k]-1) : (2:Ng[k]-1), D))
+        for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (2:Ng[k]-1), D))
             α_UD[I]                    += T(dt) * ΦU[I, j]
             α_UD[I - WaterLily.δ(j,I)] -= T(dt) * ΦU[I, j]
         end
@@ -388,7 +395,7 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
     P_pos = zeros(T, Ng...)
     P_neg = zeros(T, Ng...)
     @inbounds for j in 1:D
-        for I in CartesianIndices(ntuple(k -> k == j ? (3:Ng[k]-1) : (2:Ng[k]-1), D))
+        for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (2:Ng[k]-1), D))
             af = A[I, j]
             Im = I - WaterLily.δ(j, I)
             # af > 0: ΦH > ΦU, more α flows into cell I (downstream), less stays in Im
@@ -415,7 +422,7 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
     # 6. Face-level λ — Zalesak's rule.
     λ_face = ones(T, Ng..., D)
     @inbounds for j in 1:D
-        for I in CartesianIndices(ntuple(k -> k == j ? (3:Ng[k]-1) : (2:Ng[k]-1), D))
+        for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (2:Ng[k]-1), D))
             af = A[I, j]
             Im = I - WaterLily.δ(j, I)
             if af > 0
@@ -429,7 +436,7 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
     # 7. Apply: α_new = α_UD + dt · "div" of (λ · A)
     # Same convention: corr enters I, leaves Im.
     @inbounds for j in 1:D
-        for I in CartesianIndices(ntuple(k -> k == j ? (3:Ng[k]-1) : (2:Ng[k]-1), D))
+        for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (2:Ng[k]-1), D))
             corr = T(dt) * λ_face[I, j] * A[I, j]
             α_UD[I]                    += corr
             α_UD[I - WaterLily.δ(j,I)] -= corr

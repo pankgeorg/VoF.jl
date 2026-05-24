@@ -108,6 +108,19 @@ mutable struct VoFFlow{T, Sf<:AbstractArray{T}, Vf<:AbstractArray{T}}
     ρ_a :: T
     μ_w :: T
     μ_a :: T
+    # MULES workspace — allocated lazily on first call to step_vof_mules!.
+    # Each field is `nothing` until needed, then sized to the grid.
+    _mules_α_old :: Union{Nothing, Sf}
+    _mules_α_UD  :: Union{Nothing, Sf}
+    _mules_α_max :: Union{Nothing, Sf}
+    _mules_α_min :: Union{Nothing, Sf}
+    _mules_P_pos :: Union{Nothing, Sf}
+    _mules_P_neg :: Union{Nothing, Sf}
+    _mules_R_pos :: Union{Nothing, Sf}
+    _mules_R_neg :: Union{Nothing, Sf}
+    _mules_ΦU    :: Union{Nothing, Vf}
+    _mules_ΦH    :: Union{Nothing, Vf}
+    _mules_λface :: Union{Nothing, Vf}
 end
 
 function VoFFlow(grid_size::NTuple{D,Int};
@@ -126,10 +139,33 @@ function VoFFlow(grid_size::NTuple{D,Int};
     vof = VoFFlow{T, typeof(α), typeof(L)}(
         α, r, Φ, ν, L,
         T(ρ_w), T(ρ_a), T(μ_w), T(μ_a),
+        nothing, nothing, nothing, nothing,
+        nothing, nothing, nothing, nothing,
+        nothing, nothing, nothing,
     )
     _refresh_ν!(vof)
     _refresh_L!(vof)
     return vof
+end
+
+# Lazily allocate the MULES workspace on the first call to step_vof_mules!.
+function _ensure_mules_workspace!(vof::VoFFlow{T, Sf, Vf}) where {T, Sf, Vf}
+    if vof._mules_α_old !== nothing
+        return nothing
+    end
+    Ng = size(vof.α); D = ndims(vof.α)
+    vof._mules_α_old = similar(vof.α)
+    vof._mules_α_UD  = similar(vof.α)
+    vof._mules_α_max = similar(vof.α)
+    vof._mules_α_min = similar(vof.α)
+    vof._mules_P_pos = similar(vof.α)
+    vof._mules_P_neg = similar(vof.α)
+    vof._mules_R_pos = similar(vof.α)
+    vof._mules_R_neg = similar(vof.α)
+    vof._mules_ΦU    = similar(vof.L)
+    vof._mules_ΦH    = similar(vof.L)
+    vof._mules_λface = similar(vof.L)
+    return nothing
 end
 
 # Per-cell effective kinematic viscosity ν = μ_local / ρ_local.
@@ -344,22 +380,39 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
                          n_sweeps::Int = 3,   # unused for now (cell-FCT pass)
                          λ_HO = WaterLily.vanLeer,
                          perdir = ()) where T
-    α = vof.α
+    _ensure_mules_workspace!(vof)
+    α     = vof.α
+    α_old = vof._mules_α_old
+    α_UD  = vof._mules_α_UD
+    α_max = vof._mules_α_max
+    α_min = vof._mules_α_min
+    P_pos = vof._mules_P_pos
+    P_neg = vof._mules_P_neg
+    R_pos = vof._mules_R_pos
+    R_neg = vof._mules_R_neg
+    ΦU    = vof._mules_ΦU
+    ΦH    = vof._mules_ΦH
+    λface = vof._mules_λface
     u = sim.flow.u
     Ng = size(α)
     D = ndims(α)
-    α_old = copy(α)
 
-    # 1. Compute per-face upwind flux ΦU[I, j] and high-order flux ΦH[I, j].
+    # Refresh α ghost cells via the BC machinery before reading them.
+    # For non-periodic walls this is a Neumann zero-gradient reflect; for
+    # periodic directions it wraps. Without this the perdir y direction
+    # silently desyncs (review HIGH finding).
+    _bc_α!(α, perdir)
+
+    @inbounds α_old .= α
+    @inbounds fill!(P_pos, zero(T))
+    @inbounds fill!(P_neg, zero(T))
+    @inbounds fill!(λface, one(T))
+
+    # 1. Per-face upwind flux ΦU[I, j] and high-order flux ΦH[I, j].
     # WaterLily face-storage convention: face j at index I lies between
-    # cells I-δ(j,I) and I; u[CI(I,j)] is the velocity normal to that face.
-    # Boundary faces (I[j] = 2 or I[j] = Ng[j]) only get the upwind flux —
-    # the high-order ϕu stencil reaches I-2δ(j) which is out of bounds at
-    # the boundary, so we set ΦH = ΦU there ⇒ A_face = 0 ⇒ no anti-
-    # diffusive correction at boundaries (but the upwind transport still
-    # delivers / removes mass through them, fixing the drainage bug).
-    ΦU = zeros(T, Ng..., D)
-    ΦH = zeros(T, Ng..., D)
+    # cells I-δ(j,I) and I. Boundary faces (I[j] = 2 or I[j] = Ng[j]) get
+    # only the upwind flux — the high-order ϕu stencil needs I-2δ(j)
+    # which is out of bounds at the boundary, so we set ΦH = ΦU there.
     @inbounds for j in 1:D
         for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (2:Ng[k]-1), D))
             uf = u[WaterLily.CI(I, j)]
@@ -372,41 +425,32 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
         end
     end
 
-    # 2. α_UD from upwind fluxes (bounded by monotonicity)
+    # 2. α_UD from upwind fluxes (bounded by monotonicity).
     # WaterLily convention: face flux Φ enters cell I, leaves cell I-δ(j,I).
-    # For boundary faces, write only to the interior cell; the ghost cell
-    # represents the Dirichlet BC and must stay at its IC value, otherwise
-    # the inflow gets progressively drained.
-    α_UD = copy(α_old)
+    # Writing to I[j]=Ng[j] or Im[j]=1 just modifies the ghost layer;
+    # the subsequent BC! call at the top of the NEXT step re-imposes the
+    # correct ghost value, so we don't bother guarding those writes here.
+    @inbounds α_UD .= α_old
     @inbounds for j in 1:D
         for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (2:Ng[k]-1), D))
             Im = I - WaterLily.δ(j, I)
-            if I.I[j] != Ng[j]
-                α_UD[I] += T(dt) * ΦU[I, j]
-            end
-            if Im.I[j] != 1
-                α_UD[Im] -= T(dt) * ΦU[I, j]
-            end
+            α_UD[I]  += T(dt) * ΦU[I, j]
+            α_UD[Im] -= T(dt) * ΦU[I, j]
         end
     end
 
-    # 3. Anti-diffusive face flux
-    A = ΦH .- ΦU
+    # Re-impose α BC on α_UD (ghost was disturbed by the flux loop above).
+    _bc_α!(α_UD, perdir)
 
-    # 4. Local extrema per cell
-    α_max = similar(α)
-    α_min = similar(α)
+    # 3. Local extrema per cell (from α_old over a 3-point per-direction stencil).
     _local_extrema!(α_max, α_min, α_old, Ng, D)
 
-    # 5. For each cell, compute the total positive / negative anti-diffusive
-    # flux contributions and the corresponding R_pos, R_neg fractions.
-    P_pos = zeros(T, Ng...)
-    P_neg = zeros(T, Ng...)
+    # 4. Cell-by-cell accumulate the positive / negative anti-diffusive
+    # contributions from all incident faces.
     @inbounds for j in 1:D
         for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (2:Ng[k]-1), D))
-            af = A[I, j]
+            af = ΦH[I, j] - ΦU[I, j]
             Im = I - WaterLily.δ(j, I)
-            # af > 0: ΦH > ΦU, more α flows into cell I (downstream), less stays in Im
             if af > 0
                 P_pos[I]  += af
                 P_neg[Im] += af
@@ -417,9 +461,7 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
         end
     end
 
-    ε = eps(T)
-    R_pos = similar(α)
-    R_neg = similar(α)
+    ε = T(1e-12)
     @inbounds for I in CartesianIndices(α)
         R_pos[I] = clamp((α_max[I] - α_UD[I]) / max(T(dt) * P_pos[I], ε),
                          zero(T), one(T))
@@ -427,46 +469,58 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
                          zero(T), one(T))
     end
 
-    # 6. Face-level λ — Zalesak's rule.
-    λ_face = ones(T, Ng..., D)
+    # 5. Face-level λ — Zalesak's rule. Then apply: α_new = α_UD + dt·div(λ·A).
     @inbounds for j in 1:D
         for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (2:Ng[k]-1), D))
-            af = A[I, j]
+            af = ΦH[I, j] - ΦU[I, j]
             Im = I - WaterLily.δ(j, I)
-            if af > 0
-                λ_face[I, j] = min(R_pos[I], R_neg[Im])
+            λij = if af > 0
+                min(R_pos[I], R_neg[Im])
             elseif af < 0
-                λ_face[I, j] = min(R_pos[Im], R_neg[I])
+                min(R_pos[Im], R_neg[I])
+            else
+                one(T)
             end
+            λface[I, j] = λij
+            corr = T(dt) * λij * af
+            α_UD[I]  += corr
+            α_UD[Im] -= corr
         end
     end
 
-    # 7. Apply: α_new = α_UD + dt · "div" of (λ · A)
-    # Same convention: corr enters I, leaves Im. Skip ghost-cell writes
-    # for boundary faces.
-    @inbounds for j in 1:D
-        for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (2:Ng[k]-1), D))
-            corr = T(dt) * λ_face[I, j] * A[I, j]
-            Im = I - WaterLily.δ(j, I)
-            if I.I[j] != Ng[j]
-                α_UD[I] += corr
-            end
-            if Im.I[j] != 1
-                α_UD[Im] -= corr
-            end
-        end
-    end
-
-    # 8. Copy back and refresh ν / L / Poisson.
+    # 6. Copy back, re-impose α BCs, refresh ν / L / Poisson.
     @inbounds for I in CartesianIndices(α)
         vof.α[I] = clamp(α_UD[I], zero(T), one(T))
     end
+    _bc_α!(vof.α, perdir)
     _refresh_ν!(vof)
     _refresh_L!(vof; perdir=perdir)
     sim.pois.levels[1].L .= vof.L
     sim.pois.L           .= vof.L
     WaterLily.update!(sim.pois)
     return vof.α
+end
+
+# Boundary conditions for the scalar α field:
+#   - periodic directions (in `perdir`) wrap via `WaterLily.perBC!`
+#   - other directions get zero-gradient Neumann (ghost = first interior)
+function _bc_α!(α::AbstractArray{T,D}, perdir) where {T,D}
+    N = size(α)
+    # Periodic directions
+    WaterLily.perBC!(α, perdir, N)
+    # Neumann (zero-gradient) on the non-periodic directions
+    for j in 1:D
+        j in perdir && continue
+        # lower ghost at I[j]=1 ← α at I[j]=2
+        @inbounds for I in CartesianIndices(ntuple(k -> k == j ? (1:1) : (1:N[k]), D))
+            α[I] = α[I + WaterLily.δ(j, I)]
+        end
+        # upper ghost at I[j]=N[j] ← α at I[j]=N[j]-1
+        @inbounds for I in CartesianIndices(ntuple(k -> k == j ? (N[j]:N[j]) : (1:N[k]), D))
+            α[I] = α[I - WaterLily.δ(j, I)]
+        end
+    end
+    return α
 end
 
 # Local 3-point per-direction extrema for each cell (interior only).

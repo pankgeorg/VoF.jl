@@ -374,11 +374,19 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
 
     # 2. α_UD from upwind fluxes (bounded by monotonicity)
     # WaterLily convention: face flux Φ enters cell I, leaves cell I-δ(j,I).
+    # For boundary faces, write only to the interior cell; the ghost cell
+    # represents the Dirichlet BC and must stay at its IC value, otherwise
+    # the inflow gets progressively drained.
     α_UD = copy(α_old)
     @inbounds for j in 1:D
         for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (2:Ng[k]-1), D))
-            α_UD[I]                    += T(dt) * ΦU[I, j]
-            α_UD[I - WaterLily.δ(j,I)] -= T(dt) * ΦU[I, j]
+            Im = I - WaterLily.δ(j, I)
+            if I.I[j] != Ng[j]
+                α_UD[I] += T(dt) * ΦU[I, j]
+            end
+            if Im.I[j] != 1
+                α_UD[Im] -= T(dt) * ΦU[I, j]
+            end
         end
     end
 
@@ -434,12 +442,18 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
     end
 
     # 7. Apply: α_new = α_UD + dt · "div" of (λ · A)
-    # Same convention: corr enters I, leaves Im.
+    # Same convention: corr enters I, leaves Im. Skip ghost-cell writes
+    # for boundary faces.
     @inbounds for j in 1:D
         for I in CartesianIndices(ntuple(k -> k == j ? (2:Ng[k]) : (2:Ng[k]-1), D))
             corr = T(dt) * λ_face[I, j] * A[I, j]
-            α_UD[I]                    += corr
-            α_UD[I - WaterLily.δ(j,I)] -= corr
+            Im = I - WaterLily.δ(j, I)
+            if I.I[j] != Ng[j]
+                α_UD[I] += corr
+            end
+            if Im.I[j] != 1
+                α_UD[Im] -= corr
+            end
         end
     end
 

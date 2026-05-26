@@ -46,6 +46,19 @@ end
 
 @inline _ic_loc(I::CartesianIndex{D}, T) where D = SVector{D,T}(I.I .- 1.5)
 
+"""
+    _fill_ic!(α, f, T)
+
+Fill the α array from a user-supplied initial-condition function `f`.
+Dispatches on the arity of `f` to support three common forms:
+
+  * `f(i, x_cell)` — WaterLily-style with a component index
+  * `f(I::CartesianIndex)` — index-only
+  * `f(x_cell)` — position-only
+
+`x_cell` is the cell-centre world coordinate (one-half cell inset from
+the array origin, matching WaterLily's ghost convention).
+"""
 function _fill_ic!(α::AbstractArray{T,D}, f, ::Type{T}) where {T,D}
     if hasmethod(f, Tuple{Int,AbstractVector})
         for I in CartesianIndices(α)
@@ -178,10 +191,17 @@ function _refresh_ν!(vof::VoFFlow{T}) where T
     return vof.ν
 end
 
-# Face-staggered Poisson coefficient L = 1/ρ_face.
-# ρ_face[I,j] is the density at the j-face of cell I — the face shared with
-# cell I-δ(j,I).  Use harmonic mean of 1/ρ (i.e. arithmetic mean of 1/ρ) for
-# smoother transitions across the interface.
+"""
+    _refresh_L!(vof; perdir=())
+
+Recompute the face-staggered Poisson coefficient `L = 1/ρ_face` from
+the current `vof.α`. `ρ_face[I, j]` is the density at the j-face of
+cell I (the face shared with cell `I - δ(j,I)`); the harmonic mean of
+`1/ρ` (= arithmetic mean of `1/ρ`) is used so the coefficient smooths
+across the interface without picking up artefacts of the density jump.
+Wall ghost faces are set to zero via `WaterLily.BC!`, matching the
+μ₀ no-flux convention.
+"""
 function _refresh_L!(vof::VoFFlow{T}; perdir=()) where T
     α   = vof.α
     L   = vof.L
@@ -500,9 +520,14 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
     return vof.α
 end
 
-# Boundary conditions for the scalar α field:
-#   - periodic directions (in `perdir`) wrap via `WaterLily.perBC!`
-#   - other directions get zero-gradient Neumann (ghost = first interior)
+"""
+    _bc_α!(α, perdir) -> α
+
+Apply boundary conditions to the scalar `α` field in-place. Periodic
+directions (those listed in `perdir`) wrap via `WaterLily.perBC!`;
+the remaining directions get zero-gradient Neumann (ghost cell copies
+the first interior cell on each face).
+"""
 function _bc_α!(α::AbstractArray{T,D}, perdir) where {T,D}
     N = size(α)
     # Periodic directions
@@ -522,7 +547,15 @@ function _bc_α!(α::AbstractArray{T,D}, perdir) where {T,D}
     return α
 end
 
-# Local 3-point per-direction extrema for each cell (interior only).
+"""
+    _local_extrema!(α_max, α_min, α, Ng) -> (α_max, α_min)
+
+Fill `α_max[I]` and `α_min[I]` with the maximum and minimum of `α`
+over `I` and its 2D neighbouring cells (3-point stencil per axis,
+interior only). Used by `step_vof_mules!` to build the local envelope
+for Zalesak limiting — the per-cell α target stays inside this
+envelope on every step.
+"""
 function _local_extrema!(α_max, α_min,
                         α::AbstractArray{T,D},
                         Ng::NTuple) where {T,D}

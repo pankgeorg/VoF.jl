@@ -31,5 +31,16 @@ jobs:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v2
+      # VoF.jl uses WaterLily.transport! and the per-cell ν hook, both
+      # of which live on the pankgeorg/WaterLily.jl fork until upstream
+      # PR-290 is merged. Install that fork explicitly.
+      - name: Install WaterLily from fork branch
+        run: |
+          rm -f Manifest.toml
+          julia --project=. -e '
+            using Pkg
+            Pkg.add(Pkg.PackageSpec(url="https://github.com/pankgeorg/WaterLily.jl", rev="upstream-pr-hooks"))
+            Pkg.instantiate()
+          '
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1

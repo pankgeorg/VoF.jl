@@ -4,7 +4,7 @@ using WaterLily
 using StaticArrays: SVector
 
 export AlphaField, step_alpha!, VoFFlow, step_vof!, build_initial_L,
-       step_vof_mules!, interior
+       step_vof_mules!, interior, viscosity
 
 # Harmonic-mean of 1/ρ for the face Poisson coefficient; module-scope so the
 # inner loop doesn't close over `vof`.
@@ -101,7 +101,8 @@ Two-phase VoF state for momentum-coupled simulations:
 
   * `α`        — cell-centered colour function (1 = water, 0 = air)
   * `ν`        — cell-centered effective kinematic viscosity (μ/ρ)_local
-                 — pass this to `Flow(...; ν=vof.ν)` (PLAN 1 Hook 1)
+                 — pass `ν=viscosity(vof)` to `Flow`/`Simulation` (a closure
+                 wrapping this field; WaterLily reads it on the fly)
   * `L`        — face-staggered Poisson L = μ₀ / ρ_face
                  — pass `pois_ctor = flow -> MultiLevelPoisson(flow.p, vof.L, flow.σ)`
   * `r, Φ`     — workspace buffers for `WaterLily.transport!`
@@ -154,6 +155,22 @@ Use to iterate physical cells without touching the one-cell ghost layer.
 """
 @inline interior(vof::VoFFlow) =
     CartesianIndices(ntuple(d -> 2:size(vof.α, d) - 1, ndims(vof.α)))
+
+"""
+    viscosity(vof::VoFFlow)
+
+Closure `I -> ν[I]` over the effective-viscosity field, for passing to
+`Flow(...; ν=viscosity(vof))` / `Simulation(...; ν=viscosity(vof))`.
+
+WaterLily reads the effective viscosity on the fly through this closure
+(no separate stored array on the `Flow`). It wraps `vof.ν` by reference,
+so each in-place `_refresh_ν!` is seen by the next step — the same
+contract as passing the array directly, which WaterLily no longer
+accepts.
+"""
+@inline viscosity(vof::VoFFlow) = let ν = vof.ν
+    I -> @inbounds ν[I]
+end
 
 function VoFFlow(grid_size::NTuple{D,Int};
                  α₀,
@@ -233,7 +250,7 @@ Post-step VoF update:
   4. propagate `vof.L` into the MultiLevelPoisson levels via `WaterLily.update!`
 
 Call this after `sim_step!(sim)`. The Flow must have been constructed with
-`ν = vof.ν` and the Poisson with L matched to `vof.L` (see VoFFlow docstring).
+`ν = viscosity(vof)` and the Poisson with L matched to `vof.L` (see VoFFlow docstring).
 """
 function step_vof!(vof::VoFFlow{T}, sim;
                    dt::Real = sim.flow.Δt[end-1],

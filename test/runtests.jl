@@ -53,7 +53,7 @@ using StaticArrays
         )
         flow = WaterLily.Flow(dims, (0f0, 0f0);
             T = Float32,
-            ν = vof.ν,
+            ν = viscosity(vof),
             g = (i, x, t) -> i == 2 ? -9.81f0 : 0f0,
         )
         # Build a minimal struct that pretends to be a Simulation —
@@ -163,7 +163,7 @@ using StaticArrays
             ρ_w = 1.0, ρ_a = 1.0, μ_w = 1e-3, μ_a = 1e-3,
         )
         sim = WaterLily.Simulation(dims, (1f0, 0f0, 0f0), 1f0;
-            T = Float32, ν = vof.ν, Δt = 0.25f0, ϵ = 1, U = 1f0,
+            T = Float32, ν = viscosity(vof), Δt = 0.25f0, ϵ = 1, U = 1f0,
         )
         sim.flow.u .= 0f0
         sim.flow.u[:, :, :, 1] .= 1f0

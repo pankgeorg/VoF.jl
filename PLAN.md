@@ -155,8 +155,10 @@ under 2× on a 256³ damBreak, that's a win.
 | 1 | Pure α-advection passes Zalesak                       | Layer 1 disk test green                    | ✅     |
 | 2 | Coupled VoF+momentum on dry damBreak                  | Layer 1 dam break passes                   | ✅     |
 | 3 | Surface tension on rising bubble (Hysing)             | Layer 1 bubble test in published envelope  | ⛔ todo |
-| 4 | damBreak vs OpenFOAM ±10%                             | Layer 2 passes nightly                     | ✅ at ρ=10 (RMS 4.4% vs Martin-Moyce 1952); ρ=1000 needs N=128 |
-| 5 | DTC hull in waves vs OpenFOAM ±15%                    | Layer 3 — release-blocking                 | ⛔ todo |
+| 4 | damBreak vs OpenFOAM ±10%                             | Layer 2 passes nightly                     | ✅ at ρ=10 (RMS 4.4% vs Martin-Moyce 1952); ρ=1000 N=128 run 2026-06-11 — converges, known ~13% systematic vs MM (air-drag + clamp concentration) |
+| — | **Phase-2 MASTER_PLAN gate** (Poisson @ ρ=1000; mass <0.1%/5 s) | both criteria over a 5 s run         | ✅ **PASSED 2026-06-11** — ρ=1000 N=128, 5 s, `density_coefficient!` path: mass 1.0000 (clamp+mass_repair AND MULES), Poisson ≈2 V-cycles/projection throughout. See `ShipFlow.jl/RESULTS-damBreak.md` |
+| — | **Interface-compression flux** (interFoam `cAlpha·|u_r|·α(1-α)`) | MULES keeps a sharp interface over 5 s sloshing | ⛔ **new, high** — gate run showed MULES homogenizes α to ≈0.125 by t=5 s without it; until then use `step_vof!`+`mass_repair` for long runs |
+| 5 | DTC hull in waves vs OpenFOAM ±15%                    | Layer 3 — release-blocking                 | ⛔ todo (pinned on DTC offsets, BLOCKER #1) |
 
 See [`../ShipFlow.jl/RESULTS-damBreak.md`](https://github.com/pankgeorg/ShipFlow.jl/blob/main/RESULTS-damBreak.md)
 for the milestone-4 evidence package.

@@ -645,11 +645,13 @@ end
 
 MULES α-advection step. Replaces `step_vof!` for cases where local
 mass conservation matters (Kelvin waves, sloshing, …). The high-order
-flux is computed with `λ_HO` (vanLeer by default) plus an
+flux is computed with `λ_HO` (vanLeer by default) plus an optional
 interface-compression flux `c_α·|u_f|·n̂·α(1-α)` (interFoam-style;
-`c_α=1` default, `c_α=0` disables), the upwind flux provides the
-monotone base, and a per-face Zalesak limiter tightens λ_face to keep
-each cell's α inside its local extremum envelope.
+`c_α=0` default — pass `c_α=1` for gentle free-surface flows where
+sharpness retention matters; avoid in violent/breaking flows), the
+upwind flux provides the monotone base, and a per-face Zalesak limiter
+tightens λ_face to keep each cell's α inside its local extremum
+envelope.
 
 After advecting α, refreshes `vof.ν` and `vof.L` exactly as `step_vof!`
 does.
@@ -689,12 +691,17 @@ end
 # untyped kwarg is NOT specialized by Julia, so every ϕu(...,λ_HO) call
 # in the face-flux loop would dynamically dispatch and box (566 KiB/call
 # at N=64² vs 4 KiB specialized).
-# `c_α` scales the interface-compression flux: 0 = plain MULES (old
-# behaviour, diffusive over long runs), 1 = interFoam default.
+# `c_α` scales the interface-compression flux: 0 (default) = plain
+# MULES — bounded but diffusive over long runs; 1 = interFoam-strength
+# compression. Compression is OPT-IN because a sharp algebraic
+# interface destabilizes the u-advecting momentum coupling in violent
+# flows (wall slam, body-generated breaking waves — see
+# ShipFlow.jl/RESULTS-damBreak.md); it is validated and recommended for
+# gentle free-surface flows (RESULTS-sloshing.md).
 function step_vof_mules!(vof::VoFFlow{T}, sim;
                          dt::Real = sim.flow.Δt[end-1],
                          λ_HO::FH = WaterLily.vanLeer,
-                         c_α::Real = one(T),
+                         c_α::Real = zero(T),
                          perdir = ()) where {T, FH}
     α     = vof.α
     α_old = vof._mules_α_old

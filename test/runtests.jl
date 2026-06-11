@@ -174,6 +174,42 @@ using StaticArrays
         @test maximum(vof.α) ≤ 1f0 + 1f-4
     end
 
+    @testset "MULES compression sharpens and conserves" begin
+        # A pre-smeared interface advected at uniform velocity. With the
+        # interFoam-style compression flux (c_α=1) the interface must
+        # stay at least as sharp as without it (c_α=0), while mass stays
+        # exactly conserved and α bounded — the Zalesak envelope limits
+        # the compression like any other anti-diffusive flux.
+        dims = (64, 8)
+        mk() = VoFFlow(dims;
+            # water band 13 < x < 35 with ~6-cell smeared edges, zero at
+            # both walls so the open boundaries exchange no mass (a
+            # column touching x=0 would legitimately gain inflow mass
+            # through the upwind boundary flux)
+            α₀ = (i, x) -> clamp((8f0 - abs(x[1] - 24f0)) / 6f0 + 0.5f0, 0f0, 1f0),
+            ρ_w = 1.0, ρ_a = 1.0, μ_w = 1e-3, μ_a = 1e-3,
+        )
+        mkflow() = (f = WaterLily.Flow(dims, (1f0, 0f0); T = Float32, Δt = 0.2f0);
+                    f.u .= 0f0; f.u[:, :, 1] .= 1f0; f)
+        width(α)  = count(c -> 0.01f0 < c < 0.99f0, @view α[2:dims[1]+1, 2:dims[2]+1])
+        mass(α)   = sum(@view α[2:dims[1]+1, 2:dims[2]+1])
+
+        vof0, vof1 = mk(), mk()
+        sim0 = (flow = mkflow(), pois = WaterLily.MultiLevelPoisson(zeros(Float32, dims .+ 2), copy(vof0.L), zeros(Float32, dims .+ 2)))
+        sim1 = (flow = mkflow(), pois = WaterLily.MultiLevelPoisson(zeros(Float32, dims .+ 2), copy(vof1.L), zeros(Float32, dims .+ 2)))
+        m0 = mass(vof0.α)
+        for _ in 1:20
+            step_vof_mules!(vof0, sim0; dt = 0.2f0, c_α = 0)
+            step_vof_mules!(vof1, sim1; dt = 0.2f0, c_α = 1)
+        end
+        @test mass(vof0.α) ≈ m0 rtol = 1f-5      # both conserve
+        @test mass(vof1.α) ≈ m0 rtol = 1f-5
+        @test minimum(vof1.α) ≥ -1f-4            # bounded with compression
+        @test maximum(vof1.α) ≤ 1f0 + 1f-4
+        @test width(vof1.α) ≤ width(vof0.α)      # at least as sharp
+        @test width(vof1.α) ≤ 4 * dims[2]        # and genuinely thin (≤4 cells/row)
+    end
+
     @testset "interior() helper hits only physical cells" begin
         dims = (8, 8, 8)
         vof = VoFFlow(dims;

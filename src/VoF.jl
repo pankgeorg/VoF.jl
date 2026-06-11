@@ -405,20 +405,56 @@ end
 
 MULES α-advection step. Replaces `step_vof!` for cases where local
 mass conservation matters (Kelvin waves, sloshing, …). The high-order
-flux is computed with `λ_HO` (vanLeer by default), the upwind flux
-provides the monotone base, and a per-face Zalesak limiter tightens
-λ_face to keep each cell's α inside its local extremum envelope.
+flux is computed with `λ_HO` (vanLeer by default) plus an
+interface-compression flux `c_α·|u_f|·n̂·α(1-α)` (interFoam-style;
+`c_α=1` default, `c_α=0` disables), the upwind flux provides the
+monotone base, and a per-face Zalesak limiter tightens λ_face to keep
+each cell's α inside its local extremum envelope.
 
 After advecting α, refreshes `vof.ν` and `vof.L` exactly as `step_vof!`
 does.
 """
+# Interface-compression face flux (interFoam's cAlpha mechanism,
+# reimplemented from the description in Berberović et al., Phys. Rev. E
+# 79, 2009 — never from OpenFOAM source):
+#
+#     Φc[I,j] = c_α · |u_f| · n̂_j · α_f(1-α_f)
+#
+# where n̂ = ∇α/|∇α| at the face (normal component exact, tangential
+# from averaged central differences) and α_f is the face mean. The term
+# transports α *up-gradient* (anti-diffusion along the interface
+# normal); α(1-α) confines it to interface cells, and the Zalesak
+# envelope in step 5 keeps the result bounded — FCT applied to
+# high-order + compression. Without it plain MULES has no re-steepening
+# mechanism and homogenizes over long runs (see the 2026-06-11 Phase-2
+# gate run in ShipFlow.jl/RESULTS-damBreak.md).
+@inline function _compression_flux(α::AbstractArray{T,D}, uf, c_α, j, I) where {T,D}
+    Im = I - WaterLily.δ(j, I)
+    @inbounds αf = (α[I] + α[Im]) / 2
+    s = αf * (one(T) - αf)
+    s <= zero(T) && return zero(T)          # only interface cells compress
+    @inbounds gj = α[I] - α[Im]             # exact face-normal gradient
+    g2 = gj * gj
+    @inbounds for k in 1:D
+        k == j && continue
+        δk = WaterLily.δ(k, I)
+        gk = (α[Im+δk] - α[Im-δk] + α[I+δk] - α[I-δk]) / 4
+        g2 += gk * gk
+    end
+    g2 <= eps(T) && return zero(T)
+    return c_α * abs(uf) * (gj / sqrt(g2)) * s
+end
+
 # `λ_HO::FH` forces specialization on the limiter function — a plain
 # untyped kwarg is NOT specialized by Julia, so every ϕu(...,λ_HO) call
 # in the face-flux loop would dynamically dispatch and box (566 KiB/call
 # at N=64² vs 4 KiB specialized).
+# `c_α` scales the interface-compression flux: 0 = plain MULES (old
+# behaviour, diffusive over long runs), 1 = interFoam default.
 function step_vof_mules!(vof::VoFFlow{T}, sim;
                          dt::Real = sim.flow.Δt[end-1],
                          λ_HO::FH = WaterLily.vanLeer,
+                         c_α::Real = one(T),
                          perdir = ()) where {T, FH}
     α     = vof.α
     α_old = vof._mules_α_old
@@ -435,6 +471,7 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
     u = sim.flow.u
     Ng = size(α)
     D = ndims(α)
+    cα_T = T(c_α)
 
     # Refresh α ghost cells via the BC machinery before reading them.
     # For non-periodic walls this is a Neumann zero-gradient reflect; for
@@ -459,7 +496,8 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
             if I.I[j] == 2 || I.I[j] == Ng[j]
                 ΦH[I, j] = ΦU[I, j]    # no anti-diff at boundary
             else
-                ΦH[I, j] = WaterLily.ϕu(j, I, α_old, uf, λ_HO)
+                ΦH[I, j] = WaterLily.ϕu(j, I, α_old, uf, λ_HO) +
+                           _compression_flux(α_old, uf, cα_T, j, I)
             end
         end
     end

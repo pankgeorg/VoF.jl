@@ -1,7 +1,7 @@
 module VoF
 
 using WaterLily
-using StaticArrays: SVector
+using StaticArrays: SVector, MMatrix
 
 export AlphaField, step_alpha!, VoFFlow, step_vof!, build_initial_L,
        step_vof_mules!, interior, viscosity,
@@ -443,6 +443,111 @@ function curvature!(vof::VoFFlow{T}; passes::Int = 4) where T
     return κ
 end
 
+# --- Height-function curvature (Popinet, JCP 228, 2009; reimplemented from
+# the paper, not from any GPL code) -------------------------------------------
+#
+# For an interface cell, build water-thickness columns H_t = Σ_k α along
+# the axis closest to the interface normal (window ±3 cells), one column
+# per tangential offset t. The curvature of the thickness function is
+# orientation-free: a water bump and a water trough get opposite signs
+# automatically, matching the `-∇·n̂` convention of `curvature!`
+# (water disk → κ=+1/R, air bubble → κ=−1/R).
+#
+# A column is VALID only if, oriented along decreasing α, it runs from
+# full (α>0.95) to empty (α<0.05) inside the window — i.e. it crosses
+# the interface exactly once. Cells with any invalid column fall back
+# to the smoothed-CSF estimate, so `curvature!(vof; method=:height)`
+# is always defined everywhere `:smoothed` is.
+
+# thickness column at cell I, direction axis `d`, sign `sd` (+e toward air),
+# tangential offset `off` (a CartesianIndex displacement). Returns (H, valid).
+@inline function _hf_column(α::AbstractArray{T,D}, I, d, sd, off, win) where {T,D}
+    base = I + off
+    Ng = size(α)
+    # window bounds check
+    lo = base - win * sd * WaterLily.δ(d, base)
+    hi = base + win * sd * WaterLily.δ(d, base)
+    for (P, lim) in ((lo, Ng), (hi, Ng))
+        for k in 1:D
+            (1 <= P.I[k] <= lim[k]) || return zero(T), false
+        end
+    end
+    H = zero(T)
+    @inbounds for k in -win:win
+        H += α[base + k * sd * WaterLily.δ(d, base)]
+    end
+    @inbounds αw = α[base - win * sd * WaterLily.δ(d, base)]   # water end
+    @inbounds αa = α[base + win * sd * WaterLily.δ(d, base)]   # air end
+    valid = (αw > T(0.95)) & (αa < T(0.05))
+    return H, valid
+end
+
+"""
+    curvature!(vof; method=:smoothed, passes=4) -> vof._st_κ
+
+Interface curvature. `method = :smoothed` (default) is the Brackbill
+smoothed-`∇·n̂` estimate; `method = :height` uses Popinet-style
+height-function columns at interface cells (2nd-order, much lower
+scatter on sharp interfaces), falling back to the smoothed value where
+the column construction is invalid (normal too oblique within the ±3
+window, multiple crossings, or near the domain edge).
+"""
+function curvature!(vof::VoFFlow{T}, ::Val{:height}; passes::Int = 4) where T
+    α = vof.α
+    κ = curvature!(vof; passes)            # smoothed baseline + fallback
+    D = ndims(α)
+    Ng = size(α)
+    win = 3
+    @inbounds for I in CartesianIndices(ntuple(d -> 2:Ng[d]-1, D))
+        # near-interface cells: significant central α-gradient. (An
+        # α-range test misses sharp interfaces entirely — with a binary
+        # step every cell is exactly 0 or 1, yet the force samples κ on
+        # both sides of the jump.)
+        gmax = zero(T); d = 1
+        for k in 1:D
+            g = (α[I + WaterLily.δ(k, I)] - α[I - WaterLily.δ(k, I)]) / 2
+            if abs(g) > gmax
+                gmax = abs(g); d = k
+            end
+        end
+        gmax >= T(0.1) || continue
+        gd = (α[I + WaterLily.δ(d, I)] - α[I - WaterLily.δ(d, I)]) / 2
+        sd = gd < 0 ? 1 : -1                 # +e points toward air (α decreasing)
+        if D == 2
+            t = d == 1 ? 2 : 1
+            H₋, v1 = _hf_column(α, I, d, sd, -WaterLily.δ(t, I), win)
+            H₀, v2 = _hf_column(α, I, d, sd,  zero(WaterLily.δ(t, I)), win)
+            H₊, v3 = _hf_column(α, I, d, sd,  WaterLily.δ(t, I), win)
+            (v1 & v2 & v3) || continue
+            H′ = (H₊ - H₋) / 2
+            H″ = H₊ - 2H₀ + H₋
+            q = 1 + H′^2
+            κ[I] = -H″ / (q * sqrt(q))
+        else
+            t1, t2 = d == 1 ? (2, 3) : d == 2 ? (1, 3) : (1, 2)
+            δ1 = WaterLily.δ(t1, I); δ2 = WaterLily.δ(t2, I)
+            ok = true
+            Hs = MMatrix{3,3,T}(undef)
+            for j in -1:1, i in -1:1
+                h, v = _hf_column(α, I, d, sd, i * δ1 + j * δ2, win)
+                Hs[i+2, j+2] = h
+                ok &= v
+            end
+            ok || continue
+            Hx  = (Hs[3,2] - Hs[1,2]) / 2
+            Hy  = (Hs[2,3] - Hs[2,1]) / 2
+            Hxx = Hs[3,2] - 2Hs[2,2] + Hs[1,2]
+            Hyy = Hs[2,3] - 2Hs[2,2] + Hs[2,1]
+            Hxy = (Hs[3,3] - Hs[3,1] - Hs[1,3] + Hs[1,1]) / 4
+            q = 1 + Hx^2 + Hy^2
+            κ[I] = -(Hxx * (1 + Hy^2) + Hyy * (1 + Hx^2) - 2Hxy * Hx * Hy) /
+                   (q * sqrt(q))
+        end
+    end
+    return κ
+end
+curvature!(vof::VoFFlow, ::Val{:smoothed}; passes::Int = 4) = curvature!(vof; passes)
+
 """
     csf_force!(flow, vof::VoFFlow, σ; passes=4)
 
@@ -463,8 +568,9 @@ Use through WaterLily's `udf` hook:
     st! = VoF.surface_tension(vof, σ_cell)
     sim_step!(sim; udf = st!)
 """
-function csf_force!(flow, vof::VoFFlow{T}, σ; passes::Int = 4) where T
-    κ = curvature!(vof; passes)
+function csf_force!(flow, vof::VoFFlow{T}, σ; passes::Int = 4,
+                    method::Symbol = :smoothed) where T
+    κ = curvature!(vof, Val(method); passes)
     α = vof.α
     invρf = vof.L          # face 1/ρ, refreshed by step_vof!/_mules! each step
     f = flow.f
@@ -489,8 +595,8 @@ end
 Convenience wrapper: returns `(flow, t; kwargs...) -> csf_force!(flow,
 vof, σ)` for passing as `sim_step!(sim; udf = ...)`.
 """
-surface_tension(vof::VoFFlow, σ; passes::Int = 4) =
-    (flow, t; kwargs...) -> csf_force!(flow, vof, σ; passes)
+surface_tension(vof::VoFFlow, σ; passes::Int = 4, method::Symbol = :smoothed) =
+    (flow, t; kwargs...) -> csf_force!(flow, vof, σ; passes, method)
 
 # ----------------------------------------------------------------------------
 # MULES-style α-advection (Marquez Damián 2013, used in interFoam)

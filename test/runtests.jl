@@ -272,6 +272,48 @@ using StaticArrays
             end
         end
 
+        @testset "height-function curvature beats smoothed on fractional disk" begin
+            dims = (64, 64); R = 12.0; cx = cy = 33.0
+            # 8×8-supersampled area fractions — HF needs fractional cut
+            # cells (a binary step quantizes column heights to integers)
+            frac = x -> begin
+                s = 0
+                for a in 1:8, b in 1:8
+                    xx = x[1] - 0.5 + (a - 0.5)/8; yy = x[2] - 0.5 + (b - 0.5)/8
+                    s += ((xx-cx)^2 + (yy-cy)^2 < R^2)
+                end
+                Float32(s / 64)
+            end
+            vof = mkvof((i, x) -> frac(x))
+            α = vof.α
+            stats = map((:smoothed, :height)) do m
+                κ = curvature!(vof, Val(m))
+                vals = Float32[]
+                for d in 1:2, I in CartesianIndices((4:61, 4:61))
+                    Im = I - WaterLily.δ(d, I)
+                    iszero(α[I] - α[Im]) && continue
+                    push!(vals, (κ[I] + κ[Im]) / 2)
+                end
+                κref = Float32(1/R)
+                (mean = sum(vals)/length(vals),
+                 rms  = sqrt(sum((vals .- κref).^2)/length(vals)))
+            end
+            κref = Float32(1/R)
+            @test stats[2].mean ≈ κref rtol = 0.05     # HF mean within 5%
+            @test stats[2].rms < stats[1].rms           # HF tighter than smoothed
+            # sign convention: air bubble in water ⇒ κ ≈ -1/R
+            vofb = mkvof((i, x) -> 1f0 - frac(x))
+            κb = curvature!(vofb, Val(:height))
+            αb = vofb.α
+            vb = Float32[]
+            for d in 1:2, I in CartesianIndices((4:61, 4:61))
+                Im = I - WaterLily.δ(d, I)
+                iszero(αb[I] - αb[Im]) && continue
+                push!(vb, (κb[I] + κb[Im]) / 2)
+            end
+            @test sum(vb)/length(vb) ≈ -κref rtol = 0.05
+        end
+
         @testset "udf closure wires into mom_step!" begin
             dims = (32, 32); R = 8f0
             vof = mkvof((i, x) -> (x[1]-16)^2 + (x[2]-16)^2 < R^2 ? 1f0 : 0f0; dims)

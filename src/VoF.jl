@@ -444,12 +444,19 @@ function curvature!(vof::VoFFlow{T}; passes::Int = 4) where T
 end
 
 """
-    csf_force!(flow, vof::VoFFlow, σ; passes=2)
+    csf_force!(flow, vof::VoFFlow, σ; passes=4)
 
-Add the Brackbill CSF surface-tension force `σ·κ·∇α` to `flow.f`
-(face-staggered, same convention as gravity/`udf` forcing). `σ` is the
-surface-tension coefficient in **cell units**
-(`σ_cell = σ_phys / (ρ_ref · U_ref² · ΔX)`).
+Add the Brackbill CSF surface-tension **acceleration** `σ·κ·∇α / ρ_face`
+to `flow.f`. WaterLily's momentum residual is kinematic (`conv_diff!`
+works in `u` and `ν`, gravity enters as an acceleration), so the
+volumetric force `σκ∇α` must be divided by the local density; the face
+`1/ρ` is read from `vof.L` — the *same* discretization the pressure
+projection uses, which keeps the capillary pressure jump and the
+projection consistent.
+
+`σ` is in cell units consistent with the `ρ_w`/`ρ_a` passed to
+`VoFFlow`: `σ_cell = σ_phys / U_ref²` when ρ keeps its physical
+numeric value (the ΔX from κ and the 1/ρ make up the rest).
 
 Use through WaterLily's `udf` hook:
 
@@ -459,6 +466,7 @@ Use through WaterLily's `udf` hook:
 function csf_force!(flow, vof::VoFFlow{T}, σ; passes::Int = 4) where T
     κ = curvature!(vof; passes)
     α = vof.α
+    invρf = vof.L          # face 1/ρ, refreshed by step_vof!/_mules! each step
     f = flow.f
     σT = T(σ)
     D  = ndims(α)
@@ -469,14 +477,14 @@ function csf_force!(flow, vof::VoFFlow{T}, σ; passes::Int = 4) where T
             ∂α = α[I] - α[Im]                  # sharp gradient at the face
             iszero(∂α) && continue
             κf = (κ[I] + κ[Im]) / 2
-            f[I, d] += σT * κf * ∂α
+            f[I, d] += σT * κf * ∂α * invρf[I, d]
         end
     end
     return f
 end
 
 """
-    surface_tension(vof::VoFFlow, σ; passes=2) -> udf closure
+    surface_tension(vof::VoFFlow, σ; passes=4) -> udf closure
 
 Convenience wrapper: returns `(flow, t; kwargs...) -> csf_force!(flow,
 vof, σ)` for passing as `sim_step!(sim; udf = ...)`.

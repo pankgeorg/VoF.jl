@@ -412,10 +412,14 @@ provides the monotone base, and a per-face Zalesak limiter tightens
 After advecting α, refreshes `vof.ν` and `vof.L` exactly as `step_vof!`
 does.
 """
+# `λ_HO::FH` forces specialization on the limiter function — a plain
+# untyped kwarg is NOT specialized by Julia, so every ϕu(...,λ_HO) call
+# in the face-flux loop would dynamically dispatch and box (566 KiB/call
+# at N=64² vs 4 KiB specialized).
 function step_vof_mules!(vof::VoFFlow{T}, sim;
                          dt::Real = sim.flow.Δt[end-1],
-                         λ_HO = WaterLily.vanLeer,
-                         perdir = ()) where T
+                         λ_HO::FH = WaterLily.vanLeer,
+                         perdir = ()) where {T, FH}
     α     = vof.α
     α_old = vof._mules_α_old
     α_UD  = vof._mules_α_UD

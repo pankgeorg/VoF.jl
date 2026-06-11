@@ -110,8 +110,9 @@ Two-phase VoF state for momentum-coupled simulations:
 After each WaterLily step, call `step_vof!(vof, sim)` to:
   1. advect α with the just-projected velocity
   2. refresh ν_eff from the new α
-  3. refresh L (face-density-weighted) from the new α
-  4. propagate the L change through MultiLevelPoisson levels
+  3. refresh L (= 1/ρ_face) from the new α
+  4. set the Poisson coefficient via `WaterLily.density_coefficient!`
+     (L = μ₀·(1/ρ)_face, then diagonal + multigrid refresh)
 
 Gravity is applied via `Flow(...; g=(i,x,t)->(i==2 ? -g_phys : 0))` — uniform
 acceleration (same on water and air). The variable-density physics emerges
@@ -246,8 +247,10 @@ end
 Post-step VoF update:
   1. advect `vof.α` by the current `sim.flow.u`
   2. refresh `vof.ν` from the new α (consumed by `conv_diff!` on the next step)
-  3. refresh `vof.L` from the new α (face-staggered)
-  4. propagate `vof.L` into the MultiLevelPoisson levels via `WaterLily.update!`
+  3. refresh `vof.L` (= 1/ρ_face) from the new α (face-staggered)
+  4. set the Poisson coefficient `L = μ₀·(1/ρ)_face` and refresh the solver
+     via `WaterLily.density_coefficient!` (μ₀ from `sim.flow.μ₀`, so immersed
+     bodies stay consistent with the density jump)
 
 Call this after `sim_step!(sim)`. The Flow must have been constructed with
 `ν = viscosity(vof)` and the Poisson with L matched to `vof.L` (see VoFFlow docstring).
@@ -327,20 +330,14 @@ function step_vof!(vof::VoFFlow{T}, sim;
     end
     # 2. refresh ν_eff (in-place — array shared with flow)
     _refresh_ν!(vof)
-    # 3. refresh L
-    _refresh_L!(vof)
-    # 4. propagate L into the Poisson levels.
-    _push_L_to_pois!(vof, sim)
+    # 3. refresh 1/ρ_face
+    _refresh_L!(vof; perdir=perdir)
+    # 4. set the Poisson coefficient L = μ₀·(1/ρ)_face and refresh the
+    # solver (diagonal + multigrid restriction). Folding in the measured
+    # μ₀ keeps immersed bodies consistent with the density jump — the
+    # previous plain copy of vof.L dropped μ₀ entirely.
+    WaterLily.density_coefficient!(sim.pois, sim.flow.μ₀, vof.L; perdir=perdir)
     return vof.α
-end
-
-# Push the just-refreshed L into all Poisson levels. MultiLevelPoisson's
-# `L` was COPIED into `levels[1].L` at construction, so we re-copy on each
-# step and let `update!` restrict to coarser levels.
-function _push_L_to_pois!(vof::VoFFlow, sim)
-    sim.pois.levels[1].L .= vof.L
-    sim.pois.L           .= vof.L
-    WaterLily.update!(sim.pois)
 end
 
 """
@@ -533,7 +530,7 @@ function step_vof_mules!(vof::VoFFlow{T}, sim;
     _bc_α!(vof.α, perdir)
     _refresh_ν!(vof)
     _refresh_L!(vof; perdir=perdir)
-    _push_L_to_pois!(vof, sim)
+    WaterLily.density_coefficient!(sim.pois, sim.flow.μ₀, vof.L; perdir=perdir)
     return vof.α
 end
 

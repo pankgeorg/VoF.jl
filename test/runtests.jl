@@ -210,6 +210,84 @@ using StaticArrays
         @test width(vof1.α) ≤ 4 * dims[2]        # and genuinely thin (≤4 cells/row)
     end
 
+    @testset "CSF surface tension (Brackbill)" begin
+        mkvof(α₀; dims = (64, 64)) = VoFFlow(dims;
+            α₀ = α₀, ρ_w = 1.0, ρ_a = 1.0, μ_w = 1e-3, μ_a = 1e-3)
+
+        @testset "flat interface ⇒ (near-)zero force" begin
+            dims = (64, 64)
+            vof = mkvof((i, x) -> x[2] < 32 ? 1f0 : 0f0; dims)
+            flow = WaterLily.Flow(dims, (0f0, 0f0); T = Float32)
+            flow.f .= 0f0
+            csf_force!(flow, vof, 1f0)
+            # κ of a flat surface is 0 up to smoothing round-off; the
+            # force should be orders below the σ/Δx scale of a curved one
+            @test maximum(abs, flow.f) < 1f-4
+        end
+
+        @testset "circular drop: κ ≈ 1/R at the interface" begin
+            dims = (64, 64); R = 12f0; cx = cy = 33f0
+            vof = mkvof((i, x) -> (x[1]-cx)^2 + (x[2]-cy)^2 < R^2 ? 1f0 : 0f0; dims)
+            # sample κ at the faces the CSF force actually uses (raw
+            # ∂α ≠ 0), face-averaged like csf_force! does. Smoothed-CSF
+            # κ from a STEP initial α carries staircase noise per face;
+            # only statistical statements hold (the noise also largely
+            # cancels in the force — see the zero-net-force test).
+            α = vof.α
+            κ = curvature!(vof)               # default passes=4
+            vals = Float32[]
+            for d in 1:2, I in CartesianIndices((4:61, 4:61))
+                Im = I - WaterLily.δ(d, I)
+                iszero(α[I] - α[Im]) && continue
+                push!(vals, (κ[I] + κ[Im]) / 2)
+            end
+            @test !isempty(vals)
+            κref = 1/R
+            κmean = sum(vals) / length(vals)
+            @test κmean ≈ κref rtol = 0.10                   # mean within 10%
+            rmsdev = sqrt(sum((vals .- κref).^2) / length(vals))
+            @test rmsdev < 1.5 * κref                        # bounded scatter
+            # heavier smoothing must tighten the estimate
+            κ8 = curvature!(vof; passes = 8)
+            vals8 = Float32[]
+            for d in 1:2, I in CartesianIndices((4:61, 4:61))
+                Im = I - WaterLily.δ(d, I)
+                iszero(α[I] - α[Im]) && continue
+                push!(vals8, (κ8[I] + κ8[Im]) / 2)
+            end
+            @test all(v -> 0 < v < 2 * κref, vals8)          # all sane at passes=8
+        end
+
+        @testset "closed interface ⇒ zero net force" begin
+            dims = (64, 64); R = 12f0; cx = cy = 33f0
+            vof = mkvof((i, x) -> (x[1]-cx)^2 + (x[2]-cy)^2 < R^2 ? 1f0 : 0f0; dims)
+            flow = WaterLily.Flow(dims, (0f0, 0f0); T = Float32)
+            flow.f .= 0f0
+            csf_force!(flow, vof, 1f0)
+            tot = sum(abs, flow.f)
+            @test tot > 0                        # the force exists…
+            for d in 1:2                          # …but has no net component
+                net = sum(@view flow.f[2:dims[1]+1, 2:dims[2]+1, d])
+                @test abs(net) < 0.01f0 * tot
+            end
+        end
+
+        @testset "udf closure wires into mom_step!" begin
+            dims = (32, 32); R = 8f0
+            vof = mkvof((i, x) -> (x[1]-16)^2 + (x[2]-16)^2 < R^2 ? 1f0 : 0f0; dims)
+            flow = WaterLily.Flow(dims, (0f0, 0f0); T = Float32,
+                ν = viscosity(vof), Δt = 0.1)
+            pois = WaterLily.MultiLevelPoisson(flow.p, copy(vof.L), flow.σ)
+            st! = surface_tension(vof, 0.005f0)
+            WaterLily.mom_step!(flow, pois; udf = st!)
+            @test all(isfinite, flow.u)
+            # capillary pressure jump appears: interior p above exterior
+            p_in  = flow.p[16, 16]
+            p_out = flow.p[4, 4]
+            @test p_in > p_out
+        end
+    end
+
     @testset "interior() helper hits only physical cells" begin
         dims = (8, 8, 8)
         vof = VoFFlow(dims;

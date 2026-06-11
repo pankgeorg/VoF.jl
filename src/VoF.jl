@@ -4,7 +4,8 @@ using WaterLily
 using StaticArrays: SVector
 
 export AlphaField, step_alpha!, VoFFlow, step_vof!, build_initial_L,
-       step_vof_mules!, interior, viscosity
+       step_vof_mules!, interior, viscosity,
+       curvature!, csf_force!, surface_tension
 
 # Harmonic-mean of 1/ρ for the face Poisson coefficient; module-scope so the
 # inner loop doesn't close over `vof`.
@@ -146,6 +147,9 @@ struct VoFFlow{T, Sf<:AbstractArray{T}, Vf<:AbstractArray{T}}
     _mules_ΦU    :: Vf
     _mules_ΦH    :: Vf
     _mules_λface :: Vf
+    # CSF surface-tension workspace (smoothed α and cell curvature).
+    _st_αs :: Sf
+    _st_κ  :: Sf
 end
 
 """
@@ -192,6 +196,7 @@ function VoFFlow(grid_size::NTuple{D,Int};
         similar(α), similar(α), similar(α), similar(α),
         similar(α), similar(α), similar(α), similar(α),
         similar(L), similar(L), similar(L),
+        similar(α), similar(α),
     )
     _refresh_ν!(vof)
     _refresh_L!(vof)
@@ -357,6 +362,127 @@ function build_initial_L(vof::VoFFlow{T}, μ₀_flow::AbstractArray{T}) where T
     end
     return L
 end
+
+# ----------------------------------------------------------------------------
+# CSF surface tension (Brackbill, Kothe & Zemach 1992)
+# ----------------------------------------------------------------------------
+#
+# f_st = σ · κ · ∇α  as a volumetric momentum source, with the curvature
+# κ = -∇·(∇α_s/|∇α_s|) evaluated on a SMOOTHED colour function α_s
+# (Brackbill's recommendation — the raw algebraic α is too noisy for
+# second derivatives). The sharp ∇α in the force localizes it to the
+# interface band; for a closed interface the discrete force sums to ~0
+# (∮ κ n̂ ds = 0), so no spurious net momentum is injected.
+
+# K passes of a 1/2-self + 1/2-neighbour-mean Jacobi smoother. Reads α,
+# writes αs; uses κ as the ping-pong buffer.
+function _smooth_α!(αs::AbstractArray{T,D}, tmp, α; passes::Int = 4) where {T,D}
+    Ng = size(α)
+    αs .= α
+    half = T(0.5); w = half / (2D)
+    interior = CartesianIndices(ntuple(d -> 2:Ng[d]-1, D))
+    for _ in 1:passes
+        tmp .= αs
+        @inbounds for I in interior
+            s = zero(T)
+            for d in 1:D
+                δd = WaterLily.δ(d, I)
+                s += tmp[I+δd] + tmp[I-δd]
+            end
+            αs[I] = half * tmp[I] + w * s
+        end
+    end
+    return αs
+end
+
+# |∇αs| at the d-face of cell I (normal component exact, tangential from
+# averaged central differences) — same stencil as `_compression_flux`.
+@inline function _face_grad_mag(αs::AbstractArray{T,D}, d, I) where {T,D}
+    Im = I - WaterLily.δ(d, I)
+    @inbounds gd = αs[I] - αs[Im]
+    g2 = gd * gd
+    @inbounds for k in 1:D
+        k == d && continue
+        δk = WaterLily.δ(k, I)
+        gk = (αs[Im+δk] - αs[Im-δk] + αs[I+δk] - αs[I-δk]) / 4
+        g2 += gk * gk
+    end
+    return gd, sqrt(g2)
+end
+
+"""
+    curvature!(vof::VoFFlow; passes=2) -> vof._st_κ
+
+Cell-centred interface curvature `κ = -∇·(∇α_s/|∇α_s|)` from the
+smoothed colour function (`passes` Jacobi smoothing sweeps). κ is left
+zero away from the interface (where `|∇α_s|` vanishes). For a 2D water
+disk of radius R (α=1 inside), κ ≈ +1/R.
+"""
+function curvature!(vof::VoFFlow{T}; passes::Int = 4) where T
+    α  = vof.α
+    αs = _smooth_α!(vof._st_αs, vof._st_κ, α; passes)
+    κ  = vof._st_κ
+    fill!(κ, zero(T))
+    D  = ndims(α)
+    Ng = size(α)
+    ϵg = T(1e-6)
+    # κ[I] = -Σ_d ( n̂_d(face I+δd) - n̂_d(face I) ), faces indexed as in
+    # WaterLily (face d of cell I sits between I-δd and I).
+    @inbounds for I in CartesianIndices(ntuple(d -> 3:Ng[d]-2, D))
+        s = zero(T)
+        for d in 1:D
+            δd = WaterLily.δ(d, I)
+            g⁻, m⁻ = _face_grad_mag(αs, d, I)
+            g⁺, m⁺ = _face_grad_mag(αs, d, I + δd)
+            n⁻ = m⁻ > ϵg ? g⁻ / m⁻ : zero(T)
+            n⁺ = m⁺ > ϵg ? g⁺ / m⁺ : zero(T)
+            s += n⁺ - n⁻
+        end
+        κ[I] = -s
+    end
+    return κ
+end
+
+"""
+    csf_force!(flow, vof::VoFFlow, σ; passes=2)
+
+Add the Brackbill CSF surface-tension force `σ·κ·∇α` to `flow.f`
+(face-staggered, same convention as gravity/`udf` forcing). `σ` is the
+surface-tension coefficient in **cell units**
+(`σ_cell = σ_phys / (ρ_ref · U_ref² · ΔX)`).
+
+Use through WaterLily's `udf` hook:
+
+    st! = VoF.surface_tension(vof, σ_cell)
+    sim_step!(sim; udf = st!)
+"""
+function csf_force!(flow, vof::VoFFlow{T}, σ; passes::Int = 4) where T
+    κ = curvature!(vof; passes)
+    α = vof.α
+    f = flow.f
+    σT = T(σ)
+    D  = ndims(α)
+    Ng = size(α)
+    @inbounds for d in 1:D
+        for I in CartesianIndices(ntuple(k -> k == d ? (3:Ng[k]-1) : (2:Ng[k]-1), D))
+            Im = I - WaterLily.δ(d, I)
+            ∂α = α[I] - α[Im]                  # sharp gradient at the face
+            iszero(∂α) && continue
+            κf = (κ[I] + κ[Im]) / 2
+            f[I, d] += σT * κf * ∂α
+        end
+    end
+    return f
+end
+
+"""
+    surface_tension(vof::VoFFlow, σ; passes=2) -> udf closure
+
+Convenience wrapper: returns `(flow, t; kwargs...) -> csf_force!(flow,
+vof, σ)` for passing as `sim_step!(sim; udf = ...)`.
+"""
+surface_tension(vof::VoFFlow, σ; passes::Int = 4) =
+    (flow, t; kwargs...) -> csf_force!(flow, vof, σ; passes)
 
 # ----------------------------------------------------------------------------
 # MULES-style α-advection (Marquez Damián 2013, used in interFoam)
